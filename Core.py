@@ -1,12 +1,16 @@
+# import google.generativeai as genai
 from google import genai
-import requests
+# import requests
 import io
 from Bio.PDB import PDBParser, PDBList
 from Bio.PDB.PDBExceptions import PDBConstructionException
 from rdkit import Chem
-from rdkit.Chem import Descriptors, Crippen, rdMolDescriptors, Draw
+from rdkit.Chem import Descriptors, Crippen, rdMolDescriptors, Draw, AllChem
+from rdkit.Chem.rdmolfiles import MolToPDBBlock, MolToMolBlock
 import re
 import os
+import subprocess
+import numpy as np
 
 def strip_md(md_text: str) -> str:
     if not isinstance(md_text, str):
@@ -54,34 +58,7 @@ class PDBAnalyzer:
                 
         except Exception as e:
             return f"Error: Critical failure during PDB retrieval for {pdb_id}. Details {e}"
-        
-        '''try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                pdb_data = response.text
-            else:
-                # Non-200 response, try local file
-                print(
-                    f"Warning: RCSB returned {response.status_code} for {pdb_id}.pdb, checking local file..."
-                )
-        except requests.RequestException:
-            # Network/connection issue, try local file
-            print(
-                f"Warning: Failed to fetch {pdb_id}.pdb from RCSB, checking local file..."
-            )
 
-        # Fallback: check if local file exists
-        if pdb_data is None or len(pdb_data.strip()) == 0:
-            local_file = f"{pdb_id}.pdb"
-            if os.path.exists(local_file):
-                with open(local_file, "r") as f:
-                    pdb_data = f.read()
-            else:
-                return f"Error: Unable to fetch {pdb_id}.pdb from RCSB and no local copy found."
-
-        if "END" not in pdb_data.splitlines()[-1]:
-            return f"Error: Fetched data for {pdb_id} appears incomplete or invalid. Missing END record."
-        '''
         
         summary = {
             "Protein Name": None,
@@ -270,6 +247,30 @@ class CompoundAnalyzer:
         for key, value in result.items():
             out += f"{key}: {value}\n"
         return out
+    '''
+    @staticmethod
+    def generate_ligand_pdb_string(smiles: str) -> str:
+        """
+        Generates a single 3D conformer for a SMILES string and returns it as a PDB block.
+        """
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return "ERROR: Could not parse SMILES."
+            
+            mol = Chem.AddHs(mol)
+            
+            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            
+            for atom in mol.GetAtoms():
+                atom.SetProp('PDBResName', 'LIG')
+                atom.SetProp('PDBResSeq', '900')
+                
+            pdb_block = Chem.MolToDBBlock(mol)
+            return pdb_block.replace("COMPND", "HETATM")
+        except Exception as e:
+            return f"Error during 3D generation: {e}"
+        '''
 
     @staticmethod
     def visualize_smiles(smiles: str, size=(300, 300)):
@@ -283,12 +284,10 @@ class CompoundAnalyzer:
 
 
 class AIAgent:
-    def __init__(self, api_key: str):
+    def __init__(self):
         """
         Initialize the agent and connect to OpenAI's API
 
-        Args:
-            api_key: OpenAI API key
         """
         self.TEMPERATURE = 0.7
         self.MAX_TOKENS = 10000
@@ -299,11 +298,25 @@ class AIAgent:
             "content": "You are an experienced drug-designer who specializes in structure based drud-design.",
         }
 
-        self.api_key = api_key
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client()
 
     def reopen_client(self):
-        self.client = genai.Client(api_key=self.api_key)
+        self.client = genai.Client()
+
+    def stream_generate(self, prompt):
+        response = self.client.models.generate_content_stream(
+            model=self.MODEL,
+            contents=[prompt],
+            config=genai.types.GenerateContentConfig(
+                temperature=self.TEMPERATURE,
+                system_instruction=self.SYSTEM["content"],
+                max_output_tokens=self.MAX_TOKENS,
+            )
+        )
+
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
 
     def analyze_target_protein(self, pdb_id):
         # Provide a high level summary of desired protein
@@ -324,19 +337,9 @@ class AIAgent:
                     6. Drug Development Insights: Suggest potential resistance mechanisms, selectivity strategies, off-target risks, and opportunities for covalent/non-covalent modulation.
                     7. Analysis Recommendations: Indicate useful computational (docking, MD, free energy) and experimental (mutagenesis, binding assays, NMR/cryo) approaches to validate and optimize ligands."""
 
-        response = self.client.models.generate_content(
-            model=self.MODEL,
-            contents=[prompt],
-            config=genai.types.GenerateContentConfig(
-                temperature=self.TEMPERATURE,
-                system_instruction=self.SYSTEM["content"],
-                max_output_tokens=self.MAX_TOKENS,
-            )
-        )
-
         result = {
             "summary": protein_summary,
-            "analysis": strip_md(response.text),
+            "analysis": self.stream_generate(prompt),
         }
 
         return result
@@ -381,18 +384,7 @@ class AIAgent:
                         -Prioritize modifications that maintain or improve overall drug-likeness, including adherence to Lipinski's Rule of Five, QED score, and general ADME properties.
                         -Highlight any trade-offs where a modification may improve one property but slightly reduce another, and provide a rationale for why the trade-off is acceptable."""
 
-        response = self.client.models.generate_content(
-            model=self.MODEL,
-            contents=[prompt],
-            config=genai.types.GenerateContentConfig(
-                temperature=self.TEMPERATURE,
-                system_instruction=self.SYSTEM["content"],
-                max_output_tokens=self.MAX_TOKENS,
-            )
-        )
-
-        result = response.text
-        return strip_md(result)
+        return self.stream_generate(prompt)
 
     def evaluate_compound(self, pdb_id, compound):
         protein_summary = PDBAnalyzer.summarize_pdb(pdb_id)
@@ -420,15 +412,195 @@ class AIAgent:
                     5. Potential off-target concerns
                     6. Overall suitability for further development"""
 
-        response = self.client.models.generate_content(
-            model=self.MODEL,
-            contents=[prompt],
-            config=genai.types.GenerateContentConfig(
-                temperature=self.TEMPERATURE,
-                system_instruction=self.SYSTEM["content"],
-                max_output_tokens=self.MAX_TOKENS,
-            )
-        )
+        return self.stream_generate(prompt)
+    
+class DockingTools:
+        
+    @staticmethod
+    def prepare_ligand_3d(smiles: str, output_pdb_path: str = "ligand.pdb") -> str:
+        """
+        Generates a 3D conformer for a SMILES string, minimizes it, and saves it
+        as a PDB file, ready for PDBQT conversion (e.g., using openbabel/MGLTools).
+        
+        Returns the path to the saved PDB file.
+        """
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                raise ValueError("Could not parse SMILES.")
+                
+            mol = Chem.AddHs(mol)
+            AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+                
+            AllChem.MMFFOptimizeMolecule(mol)
+                
+            writer = Chem.PDBWriter(output_pdb_path)
+            writer.write(mol)
+            writer.close()
+                
+            return output_pdb_path
+            
+        except Exception as e:
+            raise RuntimeError(f"Error during ligand 3D preparation: {e}")
+        
+    @staticmethod
+    def get_protein_pdb_path(pdb_id: str, output_pdb_path: str = "protein.pdb") -> str:
+        """
+        Retrieves the PDB file from RCSB and saves it locally.
+        
+        Returns the path to teh saved PDB file.
+        """
+        pdb_id = pdb_id.strip().upper()
+        
+        try:
+            pdbl = PDBList()
+            local_file_path = pdbl.retrieve_pdb_file(pdb_id, pdir='.', file_format='pdb', overwrite=True)
+            
+            if not local_file_path or not os.path.exists(local_file_path):
+                raise FileNotFoundError(f"Bio.PDB failed to retrieve structure {pdb_id}.")
+            
+            if local_file_path != output_pdb_path:
+                os.rename(local_file_path, output_pdb_path)
+                local_file_path = output_pdb_path
+                
+            return local_file_path
+        
+        except Exception as e:
+            raise RuntimeError(f"Error during protein retrieval for {pdb_id} : {e}")
+    
+    @staticmethod    
+    def convert_to_pdbqt(input_path: str, output_path: str, is_receptor: bool = False) -> str:
+        """
+        Converts a PDB or SDF file to PDBQT using the obabel command-line tool.
+        """
+        command = ["obabel", input_path, "-O", output_path, "--p", "-h"]
+        
+        if is_receptor:
+            command.append("-xr")
+            
+        try: 
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            return output_path
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"OpenBabel conversion failed for {input_path}. stderr: {e.stderr}")
+        except FileNotFoundError:
+            raise RuntimeError("OpenBabel exceutable not found. Please install it or add it to your PATH.")
+        pass
+    
+    @staticmethod    
+    def generate_vina_config(center_x: float, center_y: float, center_z: float, size: float = 20.0, filename: str = "vina_config.txt") -> str:
+        """
+        Creates a configuration file for AutoDock Vina.
+        """
+        config_content = f"""
+        center_x = {center_x}
+        center_y = {center_y}
+        center_z = {center_z}
+        size_x = {size}
+        size_y = {size}
+        size_z = {size}
+        """
+        
+        with open(filename, "w") as f:
+            f.write(config_content)
+        return filename
+    
+    @staticmethod
+    def run_vina_docking(receptor_pdbqt_path: str, ligand_pdbqt_path: str, config_file_path: str, output_base: str = "docked") -> tuple[str, str]:
+        """
+        Executes the Vina docking run.
+        """
+        output_pdbqt = f"{output_base}_out.pdbqt"
+        
+        command = [
+            "vina",
+            "--receptor", receptor_pdbqt_path,
+            "--ligand", ligand_pdbqt_path,
+            "--config", config_file_path,
+            "--out", output_pdbqt,
+            
+        ]
+        
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
+            
+            binding_affinity_data = result.stdout
+            
+            return output_pdbqt, binding_affinity_data
+        
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Vina failed. Stderr: {e.stderr}")
+        except FileNotFoundError:
+            raise RuntimeError("Vina exceutable not found.")
+        
+    @staticmethod
+    def calculate_ligand_center(pdb_id: str, pdb_path: str) -> tuple[float, float, float]:
+        """
+        Calculates the center of mass for the first HETATM (ligand) found in the PDB.
+        """
+        parser = PDBParser(QUIET=True)
+        # The PDB path from get_protein_pdb_path is required here
+        structure = parser.get_structure('protein', pdb_path)
+    
+        ligand_coords = []
+        
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    res_name = residue.get_resname().strip()
+                    
+                    if res_name == 'N3':
+                        for atom in residue.get_atoms():
+                            ligand_coords.append(atom.get_coord())
+                            # if N3 is found, we stop and use it
+                        break
+                if ligand_coords: break
+            if ligand_coords: break
+            
+        if not ligand_coords:
+            for atom in structure.get_atoms():
+                res_id = atom.get_full_id()[3]
+                
+                if res_id[0] == 'HETATM' and atom.get_parent().get_resname() != 'HOH':
+                    ligand_coords.append(atom.get_coord())
+                    
+        if not ligand_coords:
+            if pdb_id.upper() == '6LU7':
+                print("INFO: N3 Ligand not found by parsing. Using manual 6LU7 coordinates.")
+                return 46.0, 17.5, 49.0
+            else:
+                raise ValueError("No co-crystallized ligand (HETATM) found to define the binidng site.")
+            
+        center = np.mean(np.array(ligand_coords), axis=0)
+        
+        return round(center[0], 2), round(center[1], 2), round(center[2], 2)
+        pass
 
-        result = response.text
-        return strip_md(result)
+    @staticmethod
+    def clean_protein_pdb(input_pdb_path: str, output_pdb_path: str) -> str:
+        """
+        Removes HETATM records (like water and ions) but keeps protein ATOM records.
+        """
+        try:
+            with open(input_pdb_path, 'r') as infile:
+                lines = infile.readlines()
+        
+            # Filter lines: only keep ATOM records (protein)
+            # We also keep TER, END, and sometimes the co-crystallized HETATM 
+            # but for Vina docking receptor prep, keeping only ATOM records is the safest first step.
+            cleaned_lines = [
+                line for line in lines 
+                if line.startswith("ATOM") or line.startswith("TER") or line.startswith("END")
+            ]
+        
+            with open(output_pdb_path, 'w') as outfile:
+                outfile.writelines(cleaned_lines)
+            
+            return output_pdb_path
+        
+        except Exception as e:
+            raise RuntimeError(f"Error during PDB cleaning: {e}")
+        
+        
+            
+        
